@@ -71,7 +71,8 @@ class GlazeWMClient:
     def __init__(self, uri: str):
         self.uri = uri
         self.ws: Any = None
-        self.message_queue = asyncio.Queue()
+        self.event_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.response_queue: asyncio.Queue[str] = asyncio.Queue()
 
     @property
     def is_connected(self) -> bool:
@@ -86,7 +87,17 @@ class GlazeWMClient:
             return
         try:
             async for msg in self.ws:
-                await self.message_queue.put(msg)
+                try:
+                    data = json.loads(msg)
+                    if (
+                        isinstance(data, dict)
+                        and data.get("messageType") == "client_response"
+                    ):
+                        await self.response_queue.put(msg)
+                    else:
+                        await self.event_queue.put(msg)
+                except Exception:
+                    await self.event_queue.put(msg)
         except Exception:
             pass
 
@@ -94,23 +105,21 @@ class GlazeWMClient:
         if self.is_connected:
             await self.ws.send(f"command {cmd}")
 
-    async def query(self, query_str: str) -> dict:
+    async def query(self, query_str: str) -> Dict[str, Any]:
         if not self.is_connected:
             return {}
+        # Clear any stale responses
+        while not self.response_queue.empty():
+            self.response_queue.get_nowait()
+
         await self.ws.send(query_str)
-        while True:
-            try:
-                msg = await asyncio.wait_for(self.message_queue.get(), timeout=1.0)
-                event_data = json.loads(msg)
-                if event_data.get("messageType") == "client_response":
-                    return event_data
-            except asyncio.TimeoutError:
-                # If a timeout occurs, continue the loop to try getting a message again.
-                # This prevents immediate exit on query timeout.
-                continue
-            except Exception:
-                # For any other exception (e.g., JSON decoding error), return an empty dict.
-                return {}
+        try:
+            msg = await asyncio.wait_for(self.response_queue.get(), timeout=2.0)
+            result = json.loads(str(msg))
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            # Catch timeout or decoding errors
+            return {}
 
 
 class AutoTilerApp:
@@ -119,6 +128,7 @@ class AutoTilerApp:
         self.enable_stats = enable_stats
         self.client = GlazeWMClient(config["core"]["ws_uri"])
         self.workspace_states: Dict[str, set] = {}
+        self.window_directions: Dict[str, str] = {}
 
         # 统计数据初始化
         self.stats: Dict[str, Any] = {"total_guidance": 0}
@@ -154,12 +164,14 @@ class AutoTilerApp:
             while True:
                 try:
                     msg = await asyncio.wait_for(
-                        self.client.message_queue.get(), timeout=1.0
+                        self.client.event_queue.get(), timeout=1.0
                     )
                 except asyncio.TimeoutError:
                     continue
 
-                event_data = json.loads(msg)
+                event_data = json.loads(str(msg))
+                if not isinstance(event_data, dict):
+                    continue
 
                 if event_data.get("messageType") in (
                     "event_subscription",
@@ -168,8 +180,8 @@ class AutoTilerApp:
                     event_type = event_data.get("data", {}).get("eventType", "unknown")
                     await asyncio.sleep(debounce)
                     # 清空积压消息
-                    while not self.client.message_queue.empty():
-                        self.client.message_queue.get_nowait()
+                    while not self.client.event_queue.empty():
+                        self.client.event_queue.get_nowait()
                     await self._apply_guidance(event_type)
         except Exception as e:
             if not isinstance(e, asyncio.TimeoutError):
@@ -181,8 +193,17 @@ class AutoTilerApp:
 
     async def _apply_guidance(self, event_type: str):
         res = await self.client.query("query workspaces")
-        workspaces = res.get("data", {}).get("workspaces", [])
-        active_ws_data = next((w for w in workspaces if w.get("hasFocus")), None)
+        if not isinstance(res, dict):
+            return
+        data = res.get("data")
+        if not isinstance(data, dict):
+            return
+        workspaces = data.get("workspaces", [])
+        if not isinstance(workspaces, list):
+            return
+        active_ws_data = next(
+            (w for w in workspaces if isinstance(w, dict) and w.get("hasFocus")), None
+        )
         if not active_ws_data:
             return
 
@@ -203,28 +224,37 @@ class AutoTilerApp:
                 else 1.0
             )
             direction = "horizontal" if ratio > 1.0 else "vertical"
-            await self.client.send_command(f"set-tiling-direction {direction}")
 
-            if not self.enable_stats:
-                return
+            if len(self.window_directions) > 1000:
+                self.window_directions.clear()
 
-            # 更新统计并保存 (兼容旧版 TotalSwitches 和 DailySwitches 字段)
-            today = datetime.now().strftime("%Y-%m-%d")
+            current_direction = self.window_directions.get(focused_win.id)
+            if current_direction != direction:
+                await self.client.send_command(str(f"set-tiling-direction {direction}"))
+                self.window_directions[focused_win.id] = direction
 
-            # 1. 更新总数
-            self.stats["TotalSwitches"] = int(self.stats.get("TotalSwitches", 0)) + 1
-            self.stats["total_guidance"] = int(self.stats.get("total_guidance", 0)) + 1
+                if self.enable_stats:
+                    # 更新统计并保存 (兼容旧版 TotalSwitches 和 DailySwitches 字段)
+                    today = datetime.now().strftime("%Y-%m-%d")
 
-            # 2. 更新每日统计
-            daily = self.stats.get("DailySwitches", {})
-            if not isinstance(daily, dict):
-                daily = {}
-            daily[today] = int(daily.get(today, 0)) + 1
-            self.stats["DailySwitches"] = daily
+                    # 1. 更新总数
+                    self.stats["TotalSwitches"] = (
+                        int(self.stats.get("TotalSwitches", 0)) + 1
+                    )
+                    self.stats["total_guidance"] = (
+                        int(self.stats.get("total_guidance", 0)) + 1
+                    )
 
-            # 每 10 次保存一次，减少 IO
-            if self.stats["total_guidance"] % 10 == 0:
-                self.save_stats()
+                    # 2. 更新每日统计
+                    daily = self.stats.get("DailySwitches", {})
+                    if not isinstance(daily, dict):
+                        daily = {}
+                    daily[today] = int(daily.get(today, 0)) + 1
+                    self.stats["DailySwitches"] = daily
+
+                    # 每 10 次保存一次，减少 IO
+                    if self.stats["total_guidance"] % 10 == 0:
+                        self.save_stats()
 
         self.workspace_states[ws.id] = current_ids
 
